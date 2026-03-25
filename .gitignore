@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+results/
+checkpoints/
+logs/
+outputs/
+wandb/
+experiments/
+external/
+tests/
+configs/
+*.log
+.claude/

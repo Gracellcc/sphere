@@ -1,0 +1,62 @@
+{
+  "training_skills": [
+    {
+      "skill_id": "train_001",
+      "title": "Early Stage Balanced",
+      "type": "training",
+      "data_selection": "均匀采样所有任务类型(spotify/venmo/multi_app/file_system)，排除成功率>80%的类型。每批16个任务。",
+      "reward_formula": "r = 1.0 * outcome + 0.3 * supervision",
+      "reward_weights": {
+        "outcome": 1.0,
+        "supervision": 0.3
+      },
+      "when_to_use": "整体成功率 < 20%",
+      "when_to_use_condition": {
+        "metric": "overall_success_rate",
+        "op": "<",
+        "value": 0.2
+      }
+    },
+    {
+      "skill_id": "train_002",
+      "title": "Weakness Focused",
+      "type": "training",
+      "data_selection": "70%选成功率最低的两个任务类型，30%均匀采样其他类型。每批16个任务。",
+      "reward_formula": "r = 0.7 * outcome + 1.0 * supervision",
+      "reward_weights": {
+        "outcome": 0.7,
+        "supervision": 1.0
+      },
+      "when_to_use": "整体成功率 > 20% 且 最弱任务类型成功率 < 10%",
+      "when_to_use_condition": {
+        "metric": "overall_success_rate",
+        "op": ">",
+        "value": 0.2,
+        "and": {
+          "metric": "weakest_type_success_rate",
+          "op": "<",
+          "value": 0.1
+        }
+      }
+    },
+    {
+      "skill_id": "train_003",
+      "title": "Efficiency Push",
+      "type": "training",
+      "data_selection": "选成功率>30%但平均步数>20的任务类型（能做对但做得慢）。每批16个任务。",
+      "reward_formula": "r = 0.5 * outcome + 1.0 * supervision + 0.3 * (1 - steps/max_steps)",
+      "reward_weights": {
+        "outcome": 0.5,
+        "supervision": 1.0,
+        "efficiency": 0.3
+      },
+      "when_to_use": "整体成功率 > 40%",
+      "when_to_use_condition": {
+        "metric": "overall_success_rate",
+        "op": ">",
+        "value": 0.4
+      }
+    }
+  ],
+  "active_skill_id": "train_001"
+}

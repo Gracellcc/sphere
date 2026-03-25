@@ -1,0 +1,616 @@
+[
+  {
+    "skill_id": "gen_001",
+    "title": "Stop doc-looping after one orienting check",
+    "principle": "Allow at most one short documentation lookup only if the endpoint family is unknown. After that, immediately issue a live call using a known starter endpoint: `spotify.show_song_library` / `spotify.show_album_library` / `spotify.show_playlist_library`, `venmo.show_social_feed`, supervisor password lookup, note list, message thread list, or file directory listing. Never do back-to-back doc reads, and never return to docs after obtaining live response fields unless a specific parameter name is blocking execution.",
+    "when_to_apply": "When you can name the app and the kind of object you need (playlist, album, song library, social feed, note, message thread, transaction).",
+    "scoring": "Positive for at most one brief doc check followed by a live API call. Negative for repeated documentation reads, doc->doc transitions, or using docs when a standard starter endpoint is available.",
+    "scoring_type": "programmatic",
+    "scoring_rule": {
+      "type": "count_ratio",
+      "count_patterns": [
+        "show_api_descriptions",
+        "show_api_doc"
+      ],
+      "normalize_by": "unique_apps",
+      "thresholds": {
+        "perfect": 1,
+        "partial": 2
+      },
+      "description": "doc_calls_per_app <= 1 → 1.0; <= 2 → 0.5; > 2 → 0.0"
+    },
+    "category": "appworld/general",
+    "guidance": "Allow at most one short documentation lookup only if the endpoint family is unknown. After that, immediately issue a live call using a known starter endpoint: `spotify.show_song_library` / `spotify.show_album_library` / `spotify.show_playlist_library`, `venmo.show_social_feed`, supervisor password lookup, note list, message thread list, or file directory listing. Never do back-to-back doc reads, and never return to docs after obtaining live response fields unless a specific parameter name is blocking execution.",
+    "when_to_use": "Use whenever the agent is tempted to inspect docs before acting."
+  },
+  {
+    "skill_id": "gen_002",
+    "title": "Use real responses to drive the next step",
+    "principle": "After each important API call, inspect the returned fields, IDs, and nesting before composing the next call. This prevents schema guessing and lets you chain the exact identifiers and field names the environment actually returns.",
+    "when_to_apply": "Immediately after login, list, search, account, or detail calls whose output will be reused.",
+    "scoring": "For each step that follows a data-returning API call: check if the next step's code references specific IDs or field names from the previous response (not hardcoded guesses). score = steps_using_real_response_data / steps_following_data_calls. If any step uses a hardcoded ID that wasn't in a prior response, score 0 for that step.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "gen_003",
+    "title": "Get credentials from system sources, not guesses",
+    "principle": "Upgrade this into an exact auth recovery routine: on any auth/session/login error, immediately call `apis.supervisor.show_account_passwords()` once, extract the matching app credentials, then retry the target app's login/session call exactly once with those returned values. After retry, immediately test access with a lightweight read endpoint in the same app (`spotify.show_song_library`/`show_album_library`/`show_playlist_library` for Spotify, `venmo.show_social_feed` for Venmo, account/profile endpoint if available). Do not invent usernames, do not open password-reset/Gmail detours, and do not repeat supervisor lookup more than once per app per episode.",
+    "when_to_apply": "When login is needed or an app appears account-scoped.",
+    "scoring": "Reward when auth errors are followed by supervisor credential retrieval and a same-app retry+read verification within the next 2 actions; penalize guessed credentials, repeated auth loops, or cross-app recovery detours after a simple auth failure.",
+    "scoring_type": "programmatic",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_account_passwords",
+        "show_account_credentials"
+      ],
+      "target_action": "login",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "credential API called before login → 1.0; else → 0.0"
+    },
+    "category": "appworld/general",
+    "guidance": "Upgrade this into an exact auth recovery routine: on any auth/session/login error, immediately call `apis.supervisor.show_account_passwords()` once, extract the matching app credentials, then retry the target app's login/session call exactly once with those returned values. After retry, immediately test access with a lightweight read endpoint in the same app (`spotify.show_song_library`/`show_album_library`/`show_playlist_library` for Spotify, `venmo.show_social_feed` for Venmo, account/profile endpoint if available). Do not invent usernames, do not open password-reset/Gmail detours, and do not repeat supervisor lookup more than once per app per episode.",
+    "when_to_use": "Use whenever any tool returns auth_error, login required, invalid session, or unauthorized."
+  },
+  {
+    "skill_id": "gen_004",
+    "title": "Test direct app access before launching recovery detours",
+    "principle": "Before starting password-reset or cross-app recovery flows, first try the target app's own read/account endpoints or existing session context. Multiple failures escalated into unnecessary recovery work even though the needed data could likely have been read directly.",
+    "when_to_apply": "When you suspect auth may be needed but have not yet tried the target app's normal endpoints.",
+    "scoring": "If agent launched a recovery/password-reset flow: check if the target app's normal endpoints were tried first. score = 1 if direct access tried first (or no recovery needed); 0 if recovery launched without trying direct access. If no recovery flow occurred, score = 1.",
+    "scoring_type": "programmatic",
+    "category": "appworld/general",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_social_feed",
+        "show_song_library",
+        "show_album_library",
+        "show_playlist_library",
+        "list_",
+        "search_",
+        "get_note",
+        "show_transaction"
+      ],
+      "target_action": "reset_password",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "direct app access tried before recovery flow → 1.0"
+    }
+  },
+  {
+    "skill_id": "gen_005",
+    "title": "Enumerate collections first, then inspect members",
+    "principle": "For libraries, feeds, playlists, albums, notes, and message sets, start with the collection endpoint to get candidate IDs, then fetch details for those candidates. This list-then-detail pattern is the core path repeatedly implied by the successful and corrected trajectories.",
+    "when_to_apply": "When the task refers to a set of user items rather than one known object.",
+    "scoring": "For each collection accessed: check if a list/index endpoint was called before any detail/show endpoint for that collection. score = collections_with_list_first / total_collections_accessed. If agent jumped directly to detail endpoints without listing, score 0 for that collection.",
+    "scoring_type": "programmatic",
+    "scoring_rule": {
+      "type": "order_check",
+      "list_patterns": [
+        "show_playlist_library",
+        "show_song_library",
+        "show_album_library",
+        "show_social_feed",
+        "search_",
+        "list_",
+        "show_all_"
+      ],
+      "detail_patterns": [
+        "show_playlist(",
+        "show_album(",
+        "show_song(",
+        "get_note(",
+        "show_transaction("
+      ],
+      "description": "list/index called before detail for each collection → ratio score"
+    },
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "gen_006",
+    "title": "Do not decide from summary rows when the task needs hidden fields",
+    "principle": "Treat list/search results as indexes, not final evidence, when the task depends on fields like play count, liked status, full note text, or transaction direction. The successful Spotify album task worked because it fetched full album details before comparing tracks.",
+    "when_to_apply": "When the answer or mutation depends on attributes that may be omitted from list/search output.",
+    "scoring": "For each decision point where the agent compares or filters items: check if full detail was fetched (via show_album, show_playlist, get_note, etc.) before the decision. score = decisions_with_full_detail / total_decision_points. If agent decided from list output alone when detail fields were needed, score 0 for that decision.",
+    "scoring_type": "programmatic",
+    "scoring_rule": {
+      "type": "detail_before_decision",
+      "detail_patterns": [
+        "show_album",
+        "show_playlist",
+        "get_note",
+        "show_transaction",
+        "show_song"
+      ],
+      "description": "full detail fetched before filtering/comparing → ratio score"
+    },
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "gen_007",
+    "title": "Paginate until you have the full candidate set",
+    "principle": "If a library or feed is paginated, keep requesting pages until exhausted before computing extrema, exporting data, or bulk-mutating. Otherwise you risk acting on only the first slice of the user's data.",
+    "when_to_apply": "When an endpoint returns pages, cursors, offsets, or partial result sets.",
+    "scoring": "For each paginated endpoint called: check if agent continued requesting pages until empty result returned (or used a while loop). score = 1 if all pages fetched; 0.5 if at least 2 pages but stopped early; 0 if only page 1 fetched without checking for more. Final score = average across paginated endpoints.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "gen_008",
+    "title": "Resolve relationship groups before filtering actions",
+    "principle": "If the task targets roommates, siblings, coworkers, or friends, first build that people set from the best available source, then map those people into the action app. The Venmo failures repeatedly came from never concretely identifying who belonged to the requested subgroup.",
+    "when_to_apply": "When the task names a social subgroup rather than explicit person IDs.",
+    "scoring": "For tasks mentioning a relationship group: check if agent explicitly built the people set (via contacts, friends list, or profile data) before filtering/mutating. score = 1 if people set was concretely resolved; 0.5 if partially resolved; 0 if agent skipped resolution and guessed. For non-group tasks, score = 1.",
+    "scoring_type": "programmatic",
+    "category": "appworld/general",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_contacts",
+        "show_friends",
+        "get_profile",
+        "show_account"
+      ],
+      "target_action": "like_",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "people set resolved before mutation → 1.0"
+    }
+  },
+  {
+    "skill_id": "gen_009",
+    "title": "Compute the exact match set before mutating anything",
+    "principle": "For bulk likes, comments, ratings, or replies, first read data and filter by all task conditions—date, relationship, direction, liked state, existing review state—then iterate mutations only over the resulting set. This avoids both inaction and over-action.",
+    "when_to_apply": "When the task asks you to change multiple items conditionally.",
+    "scoring": "For bulk mutation tasks: check if agent collected and filtered the full candidate set before any mutation call. score = 1 if all conditions applied before first mutation; 0.5 if some filtering done but incomplete; 0 if mutations started without proper filtering. For non-mutation tasks, score = 1.",
+    "scoring_type": "programmatic",
+    "category": "appworld/general",
+    "scoring_rule": {
+      "type": "order_check",
+      "list_patterns": [
+        "show_social_feed",
+        "show_song_library",
+        "search_",
+        "list_",
+        "show_all_",
+        "show_album_library"
+      ],
+      "detail_patterns": [
+        "like_",
+        "comment_",
+        "rate_song",
+        "create_review",
+        "update_review",
+        "delete_"
+      ],
+      "description": "read/filter calls before mutation calls → 1.0"
+    }
+  },
+  {
+    "skill_id": "gen_010",
+    "title": "Derive answers from item-level data, not collection names",
+    "principle": "For most/least/best/unique exports, gather the underlying items and compare or deduplicate using the actual per-item fields. The Spotify failures came from not drilling into songs/tracks where play counts, liked flags, and titles actually live.",
+    "when_to_apply": "When the task asks for an extremum, aggregate, or deduplicated result.",
+    "scoring": "For extremum/aggregate tasks: check if agent gathered item-level data (individual songs, transactions, notes) and compared per-item fields. score = 1 if comparison done at correct granularity; 0 if answer derived from collection-level metadata without drilling into items.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "gen_011",
+    "title": "Complete the full read-transform-act chain",
+    "principle": "Do not stop after finding the right source object. Once you locate the relevant note, playlist, feed item, or library entry, extract the needed payload and perform the requested final action such as send the text, write the file, like the transaction, or update the review.",
+    "when_to_apply": "When you have found the source data but have not yet produced the requested side effect.",
+    "scoring": "Check the trajectory for three phases: (1) read/locate source data, (2) transform/extract needed payload, (3) perform final action (send, write, like, update, complete_task). score = phases_completed / 3. If agent found data but never performed the final action, score <= 0.33.",
+    "scoring_type": "programmatic",
+    "category": "appworld/general",
+    "scoring_rule": {
+      "type": "order_check",
+      "list_patterns": [
+        "show_",
+        "get_",
+        "search_",
+        "list_",
+        "login"
+      ],
+      "detail_patterns": [
+        "complete_task",
+        "send_message",
+        "write_file",
+        "like_",
+        "create_review",
+        "update_"
+      ],
+      "description": "data-fetch phase before action phase → 1.0"
+    }
+  },
+  {
+    "skill_id": "gen_012",
+    "title": "Verify the final side effect before declaring success",
+    "principle": "Before finishing, confirm the requested output or mutation actually happened: the file was written, the message was sent, the ratings were updated, or the likes/comments were applied. Several failures effectively ended before any real side effect occurred.",
+    "when_to_apply": "Right before returning the final answer or marking the task complete.",
+    "scoring": "Check if agent verified the side effect before calling complete_task: e.g., read back the file, checked the sent message, confirmed the mutation response was successful. score = 1 if verification present; 0.5 if complete_task called after a successful mutation response (implicit verification); 0 if complete_task called without any prior side effect or verification.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "skill_id": "spo_001",
+    "title": "Use the correct library endpoint for the source collection",
+    "principle": "Match the task wording to the right Spotify collection endpoint: `show_song_library` for song library, `show_album_library` for album library, and `show_playlist_library` for playlists. Start from that collection instead of browsing docs or unrelated endpoints.",
+    "when_to_apply": "When a Spotify task names songs, albums, or playlists as the source set.",
+    "scoring": "Check if the first Spotify data call matches the task's source collection type. score = 1 if correct endpoint used (e.g., show_song_library for song tasks); 0.5 if correct endpoint used but not first; 0 if wrong endpoint or agent browsed docs instead.",
+    "scoring_type": "llm",
+    "category": "appworld/spotify"
+  },
+  {
+    "skill_id": "spo_002",
+    "title": "Treat album and playlist listings as ID indexes",
+    "principle": "After listing albums or playlists, call `show_album` or `show_playlist` for each returned ID to inspect the tracks. Do not try to answer track-level questions from the library listing alone.",
+    "when_to_apply": "When the task asks about songs contained inside saved albums or playlists.",
+    "scoring": "For album/playlist tasks requiring track info: check if show_album or show_playlist was called for each relevant ID after listing. score = IDs_with_detail_fetch / total_relevant_IDs. If agent answered from listing data alone, score = 0.",
+    "scoring_type": "programmatic",
+    "category": "appworld/spotify",
+    "scoring_rule": {
+      "type": "order_check",
+      "list_patterns": [
+        "show_album_library",
+        "show_playlist_library"
+      ],
+      "detail_patterns": [
+        "show_album(",
+        "show_playlist("
+      ],
+      "description": "library listed before detail fetched → 1.0"
+    }
+  },
+  {
+    "skill_id": "spo_003",
+    "title": "Compare song-level fields to answer extrema questions",
+    "principle": "For most-played, least-played, or most-liked song questions, gather all candidate songs and compare the relevant per-song field such as play count or liked/like-count field. The decision must be made at the song level, not the album or playlist level.",
+    "when_to_apply": "When a Spotify task asks for the title of the most/least X song.",
+    "scoring": "Check if agent compared the correct per-song field (play_count, like_count, etc.) across all candidates. score = 1 if correct field compared across full set; 0.5 if correct field but incomplete set; 0 if comparison done at wrong level or wrong field used.",
+    "scoring_type": "llm",
+    "category": "appworld/spotify"
+  },
+  {
+    "skill_id": "spo_004",
+    "title": "Use liked-song data to define rating targets",
+    "principle": "For tasks that rate liked songs in playlists or libraries, first identify the liked set using `show_liked_songs` or the song's liked field, then intersect that with the requested collection before rating.",
+    "when_to_apply": "When the task says to rate songs I have liked.",
+    "scoring": "Check if agent: (1) fetched liked songs or checked liked field, (2) intersected with target collection, (3) rated only the intersection. score = steps_done_correctly / 3.",
+    "scoring_type": "programmatic",
+    "category": "appworld/spotify",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_liked_songs",
+        ".liked",
+        "liked_songs"
+      ],
+      "target_action": "review",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "liked-song data checked before rating → 1.0"
+    }
+  },
+  {
+    "skill_id": "spo_005",
+    "title": "Use the complement of liked songs for unliked-only updates",
+    "principle": "For tasks that target songs not liked, read the library and liked-song state, then update only songs absent from the liked set. Do not rate every song in the library indiscriminately.",
+    "when_to_apply": "When the task says to act on songs I have not liked.",
+    "scoring": "Check if agent computed the complement (library minus liked set) before mutating. score = 1 if only unliked songs were targeted; 0.5 if mostly correct but some liked songs included; 0 if all songs rated indiscriminately.",
+    "scoring_type": "llm",
+    "category": "appworld/spotify"
+  },
+  {
+    "skill_id": "spo_006",
+    "title": "Create or update reviews instead of assuming one exists",
+    "principle": "When setting star ratings, inspect existing review state if available and then call `create_song_review` or `update_song_review` as appropriate so every target song ends at the requested rating.",
+    "when_to_apply": "When a Spotify task asks you to assign or change star ratings.",
+    "scoring": "For each rating target: check if agent used the correct API (create vs update) based on existing review state. score = correct_api_calls / total_rating_calls. If agent always used create (or always update) without checking, score = 0.5.",
+    "scoring_type": "llm",
+    "category": "appworld/spotify"
+  },
+  {
+    "skill_id": "ven_001",
+    "title": "Log in or confirm session before social-feed work",
+    "principle": "For Venmo feed tasks, authenticate first using available profile/supervisor credentials or confirm the existing session with account endpoints, then fetch the feed. Several failures never reached `show_social_feed` because they stalled before or during login.",
+    "when_to_apply": "When the task requires reading or mutating Venmo feed or transaction data.",
+    "scoring": "Check if Venmo authentication (login call with valid credentials) occurred before the first Venmo data call. score = 1 if auth before data; 0.5 if auth eventually succeeded but after failed data calls; 0 if agent never authenticated or stalled on auth.",
+    "scoring_type": "programmatic",
+    "category": "appworld/venmo",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "login",
+        "show_account"
+      ],
+      "target_action": "show_social_feed",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "login/session before feed access → 1.0"
+    }
+  },
+  {
+    "skill_id": "ven_002",
+    "title": "Fetch the social feed before deciding what to like",
+    "principle": "For 'like transactions' tasks, call `venmo.show_social_feed` and filter actual feed items by person and date. Do not infer eligible transactions from docs or friend lists alone.",
+    "when_to_apply": "When the requested action is to like items on the Venmo social feed.",
+    "scoring": "Check if show_social_feed was called and results were filtered before any like_transaction call. score = 1 if feed fetched and filtered first; 0.5 if feed fetched but filtering incomplete; 0 if likes attempted without fetching feed.",
+    "scoring_type": "programmatic",
+    "category": "appworld/venmo",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_social_feed",
+        "show_transaction"
+      ],
+      "target_action": "like_transaction",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "feed fetched before like action → 1.0"
+    }
+  },
+  {
+    "skill_id": "ven_003",
+    "title": "Filter transactions by direction and recency for payment tasks",
+    "principle": "For comment/like tasks on payments you received, inspect transaction history and keep only incoming payments within the requested time window before mutating. The key fields are sender/recipient direction plus date.",
+    "when_to_apply": "When the task mentions payments received in the last N days.",
+    "scoring": "Check if agent filtered by both direction (incoming/received) and date before mutating. score = 1 if both filters applied correctly; 0.5 if one filter applied; 0 if no filtering before mutations.",
+    "scoring_type": "llm",
+    "category": "appworld/venmo"
+  },
+  {
+    "skill_id": "ven_004",
+    "title": "Resolve people groups before feed filtering",
+    "principle": "Build the set of coworkers, siblings, roommates, or friends first using profile, friend, or related-app data, then match feed or transaction participants against that set. This is necessary before any date filtering or liking/commenting.",
+    "when_to_apply": "When a Venmo task targets a relationship group rather than named users.",
+    "scoring": "For group-targeted tasks: check if agent built the people set before filtering feed/transactions. score = 1 if people set explicitly resolved via API calls; 0.5 if partially resolved; 0 if agent guessed group members or skipped resolution.",
+    "scoring_type": "programmatic",
+    "category": "appworld/venmo",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "show_contacts",
+        "show_friends",
+        "get_profile"
+      ],
+      "target_action": "show_social_feed",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "people set resolved before feed filtering → 1.0"
+    }
+  },
+  {
+    "skill_id": "ven_005",
+    "title": "Apply all requested mutations to each matched transaction",
+    "principle": "If the task asks for both a comment and a like, perform both on every matched transaction. Do not stop after identifying the right payments or after doing only one of the requested actions.",
+    "when_to_apply": "When a Venmo task requests multiple actions on the same set of transactions.",
+    "scoring": "Count requested action types and matched transactions. score = (action_types_applied × transactions_acted_on) / (total_action_types × total_matched_transactions). If agent did only likes but not comments (or vice versa), score = 0.5.",
+    "scoring_type": "llm",
+    "category": "appworld/venmo"
+  },
+  {
+    "skill_id": "ven_006",
+    "title": "Use transaction APIs, not profile browsing, to find actionable items",
+    "principle": "Once authenticated, move quickly to `show_social_feed` or transaction-listing endpoints instead of spending steps on profile inspection. The actionable IDs live in feed/transaction results, not in static profile data.",
+    "when_to_apply": "When you already know the task is about liking or commenting on Venmo transactions.",
+    "scoring": "Count steps between successful auth and first feed/transaction API call. score = 1 if <= 1 step; 0.5 if 2-3 steps; 0 if >= 4 steps spent on profile/doc browsing before reaching feed.",
+    "scoring_type": "llm",
+    "category": "appworld/venmo"
+  },
+  {
+    "skill_id": "mul_001",
+    "title": "Map the source app and destination app immediately",
+    "principle": "For cross-app tasks, identify where the needed information lives and where the final action must happen, then execute that chain directly. The failures came from wandering through unrelated apps instead of following the source-to-destination path.",
+    "when_to_apply": "When a task requires reading in one app and acting in another.",
+    "scoring": "Check if agent's first few steps targeted the correct source and destination apps (not unrelated apps). score = 1 if first data calls went to correct apps; 0.5 if correct apps used but after detours; 0 if agent wandered through unrelated apps.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "mul_002",
+    "title": "For recommendation-text tasks, find the requester before composing the reply",
+    "principle": "Use phone texts or contacts to identify the correct conversation and confirm who asked, then send the response in that thread. This prevents finding the right content but failing to deliver it to the right person.",
+    "when_to_apply": "When someone has asked for information via phone text message.",
+    "scoring": "Check if agent: (1) found the correct conversation/requester, (2) composed the reply, (3) sent to the right thread. score = steps_completed / 3.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "mul_003",
+    "title": "Open the note fully and extract exact titles before texting",
+    "principle": "After locating the relevant note, call the note-detail endpoint and read the full body to extract the exact movie titles. Do not stop at the search result or note title.",
+    "when_to_apply": "When the final text message content comes from a note.",
+    "scoring": "Check if agent called a note-detail endpoint (not just search/list) and extracted content from the body field. score = 1 if full note read and content extracted; 0.5 if note found but content extraction incomplete; 0 if agent stopped at search results.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "mul_004",
+    "title": "Send the final message in the requested format",
+    "principle": "When replying with recommendations, transform the extracted items into the requested output format, such as a comma-separated list, and then call the phone messaging API. Finding the content is not enough.",
+    "when_to_apply": "When the task specifies how the reply should be formatted.",
+    "scoring": "Check if the sent message matches the requested format. score = 1 if message sent in correct format; 0.5 if message sent but format wrong; 0 if message never sent.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "mul_005",
+    "title": "For backup-then-delete tasks, finish the export before account termination",
+    "principle": "When a task asks you to export data and then delete an account, treat the export as a hard prerequisite. Gather the data, write the file, verify it exists, and only then call the account-deletion endpoint.",
+    "when_to_apply": "When a multi-app task combines data preservation with destructive account action.",
+    "scoring": "Check ordering: (1) data gathered, (2) file written, (3) file verified, (4) account deleted. score = 1 if all in order; 0.5 if export done but not verified before deletion; 0 if deletion happened before export or export never completed.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "mul_006",
+    "title": "Deduplicate after merging all Spotify sources",
+    "principle": "For Spotify export tasks spanning song library, album library, and playlists, collect tracks from all three sources first, then deduplicate by the requested fields before writing the CSV. Do not export each source separately without merging.",
+    "when_to_apply": "When a task asks for a unique combined export across multiple Spotify collections.",
+    "scoring": "Check if agent: (1) collected from all required sources, (2) merged into one set, (3) deduplicated before writing. score = steps_done / 3. If sources exported separately without merge, score = 0.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "skill_id": "fil_001",
+    "title": "List directories before choosing file paths",
+    "principle": "Start file tasks by listing the relevant directory so later reads and writes use real paths rather than guessed names. This avoids path errors and missed files.",
+    "when_to_apply": "When a task references a folder or output location.",
+    "scoring": "Check if a directory listing (ls, list_files, etc.) was done before file read/write operations. score = 1 if directory listed first; 0.5 if file operations succeeded without listing; 0 if path errors occurred that listing would have prevented.",
+    "scoring_type": "programmatic",
+    "category": "appworld/file_system",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "list_dir",
+        "ls ",
+        "os.listdir",
+        "show_directory"
+      ],
+      "target_action": "write_file",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.0,
+      "description": "directory listed before file write → 1.0"
+    }
+  },
+  {
+    "skill_id": "fil_002",
+    "title": "Use file operations directly instead of unrelated app detours",
+    "principle": "If the task is purely about creating, reading, or writing files, move straight to file-system APIs rather than spending steps on unrelated account or documentation flows.",
+    "when_to_apply": "When the task can be completed entirely through file operations.",
+    "scoring": "For file-only tasks: count steps before first file operation. score = 1 if file ops started within first 2 steps; 0.5 if within first 4 steps; 0 if >= 5 steps spent on unrelated flows before any file operation.",
+    "scoring_type": "llm",
+    "category": "appworld/file_system"
+  },
+  {
+    "skill_id": "fil_003",
+    "title": "Write exports in the exact requested schema",
+    "principle": "When producing a backup or CSV, use the exact filename, location, and column structure requested by the task. A nearly correct export can still fail if the path or headers are wrong.",
+    "when_to_apply": "When a task specifies an output file path or table format.",
+    "scoring": "Check if the written file matches: (1) correct path/filename, (2) correct column headers/structure, (3) correct content. score = matching_criteria / 3.",
+    "scoring_type": "llm",
+    "category": "appworld/file_system"
+  },
+  {
+    "skill_id": "fil_004",
+    "title": "Verify the file exists after writing",
+    "principle": "After creating an output file, check that it was actually written at the expected path before proceeding to any destructive follow-up step.",
+    "when_to_apply": "When a task depends on a file as the final deliverable or as a prerequisite to deletion.",
+    "scoring": "Check if agent read back or listed the file after writing it. score = 1 if file verified; 0.5 if write call succeeded (implicit verification from response); 0 if no verification and especially if destructive step followed without checking.",
+    "scoring_type": "programmatic",
+    "category": "appworld/file_system",
+    "scoring_rule": {
+      "type": "pattern_before",
+      "required_before": [
+        "write_file",
+        "save_file",
+        "export"
+      ],
+      "target_action": "complete_task",
+      "score_if_present": 1.0,
+      "score_if_absent": 0.3,
+      "description": "file write completed before declaring task done → 1.0"
+    }
+  },
+  {
+    "skill_id": "fil_005",
+    "title": "Build exports from collected records, not partial snapshots",
+    "principle": "When writing a file from app data, finish collecting all relevant records first, then write the consolidated result once. This avoids incomplete exports caused by writing too early.",
+    "when_to_apply": "When a file is the output of data gathered from multiple API calls or pages.",
+    "scoring": "Check if all data sources were collected before the file write call. score = 1 if all data gathered first then written once; 0.5 if file written in append mode across steps; 0 if file written after only partial data collection.",
+    "scoring_type": "llm",
+    "category": "appworld/file_system"
+  },
+  {
+    "skill_id": "fil_006",
+    "title": "Preserve exact text values when copying into files",
+    "principle": "When exporting titles, artists, or other user data, copy the exact returned strings rather than paraphrasing or normalizing them. Export tasks are judged on fidelity to source data.",
+    "when_to_apply": "When a file must contain values taken from another app's records.",
+    "scoring": "Compare exported values with source API response values. score = matching_values / total_values. If agent paraphrased, truncated, or reformatted any value, score 0 for that value.",
+    "scoring_type": "llm",
+    "category": "appworld/file_system"
+  },
+  {
+    "mistake_id": "cm_004",
+    "title": "Fetch full details for track-level questions",
+    "principle": "Do not try to answer track-level questions from album or playlist listings. Always call show_album or show_playlist to get full track details before answering.",
+    "scoring": "For track-level questions: check if show_album/show_playlist was called for relevant containers. score = 1 if detail endpoints called; 0 if answer derived from listing data only.",
+    "scoring_type": "llm",
+    "category": "appworld/spotify"
+  },
+  {
+    "mistake_id": "cm_005",
+    "title": "Avoid unnecessary recovery detours",
+    "principle": "When targeting coworkers, siblings, roommates, or friends, always identify the specific people in that group before filtering Venmo feed or transaction items.",
+    "scoring": "For group-targeted tasks: check if people set was explicitly resolved via API (contacts, friends, profile). score = 1 if resolved; 0 if agent guessed or skipped group resolution.",
+    "scoring_type": "programmatic",
+    "scoring_rule": {
+      "type": "count_penalty",
+      "penalty_patterns": [
+        "reset_password",
+        "forgot_password",
+        "recovery",
+        "password_reset"
+      ],
+      "thresholds": {
+        "zero": 0,
+        "one": 1
+      },
+      "description": "no recovery detours → 1.0; 1 → 0.5; >1 → 0.0"
+    },
+    "category": "appworld/venmo"
+  },
+  {
+    "mistake_id": "cm_006",
+    "title": "Perform the final action, not just find data",
+    "principle": "Do not stop after login or after finding the right note/thread. Always perform the requested final action (send message, write file, like transaction, update review, call complete_task).",
+    "scoring": "Check if the trajectory includes the final action API call that the task requested. score = 1 if final action performed; 0.5 if partial action; 0 if agent stopped before performing any final action.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "mistake_id": "cm_007",
+    "title": "Read and filter before bulk mutations",
+    "principle": "Before performing bulk likes, comments, or ratings, always read the relevant data and filter by all task conditions first. Do not mutate without proper filtering.",
+    "scoring": "For bulk mutation tasks: check if read+filter preceded mutations. score = 1 if proper read-filter-mutate sequence; 0 if mutations started without adequate filtering.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "mistake_id": "cm_008",
+    "title": "Avoid unnecessary recovery detours",
+    "principle": "Do not launch unnecessary Gmail or password-reset detours when the task could proceed through direct app access. These detours waste steps and often fail.",
+    "scoring": "Count steps spent on recovery/password-reset flows that were unnecessary (task could have been done without them). score = 1 if no unnecessary detours; 0.5 if detour occurred but agent recovered; 0 if detour consumed significant steps and hindered task completion.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "mistake_id": "cm_009",
+    "title": "Complete backup before deletion",
+    "principle": "Never delete or terminate an account before completing and verifying the required backup/export. Always verify the export file exists before any destructive action.",
+    "scoring": "For backup-then-delete tasks: check if export was completed and verified before deletion. score = 1 if correct order; 0 if deletion before export completion.",
+    "scoring_type": "llm",
+    "category": "appworld/multi_app"
+  },
+  {
+    "mistake_id": "cm_010",
+    "title": "Confirm side effects before declaring completion",
+    "principle": "Do not declare completion without confirming the side effect occurred: the text was sent, the CSV was written, the Venmo/Spotify mutation was applied. Always verify before calling complete_task.",
+    "scoring": "Check if the final side effect was confirmed (via successful API response or read-back) before complete_task. score = 1 if verified; 0.5 if side effect API returned success but no explicit verification; 0 if complete_task called without any side effect occurring.",
+    "scoring_type": "llm",
+    "category": "appworld/general"
+  },
+  {
+    "title": "Take a live first step within the first 2 actions",
+    "type": "behavioral",
+    "principle": "Make this a hard startup protocol: Action 1 must be a live tool call, never pure reasoning or doc browsing. If the task names an app or could require login, call `apis.supervisor.show_account_passwords()` first; otherwise call the most direct read/list endpoint in the target app immediately (examples: `spotify.show_song_library`, `spotify.show_album_library`, `spotify.show_playlist_library`, `venmo.show_social_feed`, file-system list/read endpoint). Action 2 must be either (a) the corresponding app login/auth call using credentials from supervisor, or (b) a detail/follow-up call using an ID returned by Action 1. Do not spend more than 1 action on docs before a live call, and if no valid tool call has happened by Action 2, abort the planning loop and issue the simplest read endpoint available.",
+    "guidance": "Make this a hard startup protocol: Action 1 must be a live tool call, never pure reasoning or doc browsing. If the task names an app or could require login, call `apis.supervisor.show_account_passwords()` first; otherwise call the most direct read/list endpoint in the target app immediately (examples: `spotify.show_song_library`, `spotify.show_album_library`, `spotify.show_playlist_library`, `venmo.show_social_feed`, file-system list/read endpoint). Action 2 must be either (a) the corresponding app login/auth call using credentials from supervisor, or (b) a detail/follow-up call using an ID returned by Action 1. Do not spend more than 1 action on docs before a live call, and if no valid tool call has happened by Action 2, abort the planning loop and issue the simplest read endpoint available.",
+    "scoring": "Reward only if a real non-doc API/tool call occurs in the first 2 actions; penalize any episode with 0 live calls or >1 documentation lookup before first app/file call.",
+    "when_to_use": "Use on all tasks, especially when recent runs show no_trajectory failures or avg failure steps < 1.",
+    "category": "execution_bootstrap"
+  }
+]
