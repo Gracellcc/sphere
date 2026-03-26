@@ -1,0 +1,443 @@
+diff --git a/agent_system/environments/env_manager.py b/agent_system/environments/env_manager.py
+index 7509992..aed9d1e 100644
+--- a/agent_system/environments/env_manager.py
++++ b/agent_system/environments/env_manager.py
+@@ -817,6 +817,32 @@ def make_envs(config):
+         import time
+         time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
+         return envs, val_envs
++    elif "appworld_ats" in config.env.env_name.lower():  # === ATS+Sphere patch ===
++        from scripts.verl.env_appworld_ats import (
++            build_appworld_ats_envs,
++            appworld_ats_projection,
++            AppWorldATSEnvironmentManager,
++        )
++
++        env_config = OmegaConf.to_container(config.env.get("appworld_ats", {}), resolve=True)
++        _envs = build_appworld_ats_envs(
++            dataset_name="train",
++            seed=config.env.seed,
++            env_num=config.data.train_batch_size,
++            group_n=group_n,
++            env_config=env_config,
++        )
++        _val_envs = build_appworld_ats_envs(
++            dataset_name="test_normal",
++            seed=config.env.seed + 1000,
++            env_num=config.data.val_batch_size,
++            group_n=1,
++            env_config=env_config,
++        )
++        projection_f = partial(appworld_ats_projection)
++        envs = AppWorldATSEnvironmentManager(_envs, projection_f, config)
++        val_envs = AppWorldATSEnvironmentManager(_val_envs, projection_f, config)
++        return envs, val_envs
+     elif "appworld_skill" in config.env.env_name.lower():
+         from agent_system.environments.env_package.appworld_skill import build_appworld_skill_envs, appworld_skill_projection
+ 
+diff --git a/agent_system/multi_turn_rollout/rollout_loop.py b/agent_system/multi_turn_rollout/rollout_loop.py
+index 7b54266..35785ae 100644
+--- a/agent_system/multi_turn_rollout/rollout_loop.py
++++ b/agent_system/multi_turn_rollout/rollout_loop.py
+@@ -241,6 +241,7 @@ class TrajectoryCollector:
+             success: Dict[str, np.ndarray],
+             traj_uid: np.ndarray,
+             tool_callings: np.ndarray,
++            total_infos: List[List[Dict]] = None,
+             ) -> DataProto:
+         """
+         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
+@@ -273,6 +274,12 @@ class TrajectoryCollector:
+                     data['episode_lengths'] = episode_lengths[bs]
+                     # tool_callings
+                     data['tool_callings'] = tool_callings[bs]
++                    # ATS: propagate trajectory_text + sgc/tgc + skills_used from env infos  # === ATS+Sphere patch ===
++                    _last_info = total_infos[bs][-1] if (total_infos and total_infos[bs]) else {}
++                    data['trajectory_text'] = _last_info.get('trajectory_text', '')
++                    data['sgc_score'] = float(_last_info.get('sgc', 0.0))
++                    data['tgc_score'] = float(_last_info.get('tgc', 0.0))
++                    data['skills_used'] = _last_info.get('skills_used', '')
+                     # success_rate
+                     for key, value in success_rate.items():
+                         data[key] = value
+@@ -414,8 +421,8 @@ class TrajectoryCollector:
+                     episode_lengths=episode_lengths,
+                     )
+         
+-        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
+-    
++        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, total_infos
++
+     def dynamic_multi_turn_loop(
+             self,
+             gen_batch: DataProto, 
+@@ -445,6 +452,7 @@ class TrajectoryCollector:
+         total_success = []
+         total_traj_uid = []
+         total_tool_callings = []
++        total_infos_all = []
+         try_count: int = 0
+         max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
+ 
+@@ -454,12 +462,12 @@ class TrajectoryCollector:
+                 print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
+             try_count += 1
+ 
+-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = self.vanilla_multi_turn_loop(
++            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings, infos_list = self.vanilla_multi_turn_loop(
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+             )
+-            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list, 
++            batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings = filter_group_data(batch_list=batch_list,
+                                                                                                 episode_rewards=episode_rewards, 
+                                                                                                 episode_lengths=episode_lengths, 
+                                                                                                 success=success, 
+@@ -475,6 +483,7 @@ class TrajectoryCollector:
+             total_success.append(success)
+             total_traj_uid.append(traj_uid)
+             total_tool_callings.append(tool_callings)
++            total_infos_all += infos_list
+ 
+         total_episode_rewards = np.concatenate(total_episode_rewards, axis=0)
+         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
+@@ -482,7 +491,7 @@ class TrajectoryCollector:
+         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
+         total_tool_callings = np.concatenate(total_tool_callings, axis=0)
+ 
+-        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings
++        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, total_tool_callings, total_infos_all
+ 
+     def multi_turn_loop(
+             self,
+@@ -509,15 +518,15 @@ class TrajectoryCollector:
+         # Initial observations from the environment
+         if self.config.algorithm.filter_groups.enable and is_train:
+             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
+-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
++            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings, total_infos = \
+                 self.dynamic_multi_turn_loop(
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+                 envs=envs,
+             )
+         else:
+-            # Vanilla Sampling   
+-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings = \
++            # Vanilla Sampling
++            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid, totoal_tool_callings, total_infos = \
+                 self.vanilla_multi_turn_loop(
+                 gen_batch=gen_batch,
+                 actor_rollout_wg=actor_rollout_wg,
+@@ -537,6 +546,7 @@ class TrajectoryCollector:
+             success=total_success,
+             traj_uid=total_traj_uid,
+             tool_callings=totoal_tool_callings,
++            total_infos=total_infos,
+         )
+         
+         return gen_batch_output
+diff --git a/verl/trainer/main_ppo.py b/verl/trainer/main_ppo.py
+index f3d23d3..243281c 100644
+--- a/verl/trainer/main_ppo.py
++++ b/verl/trainer/main_ppo.py
+@@ -149,6 +149,9 @@ class TaskRunner:
+         elif reward_manager_name == 'appworld_skill':
+             from agent_system.reward_manager import AppWorldSkillRewardManager
+             reward_manager_cls = AppWorldSkillRewardManager
++        elif reward_manager_name == 'ats':  # === ATS+Sphere patch ===
++            from scripts.verl.reward_manager_ats import ATSRewardManager
++            reward_manager_cls = ATSRewardManager
+         else:
+             raise NotImplementedError
+ 
+diff --git a/verl/utils/vllm_utils.py b/verl/utils/vllm_utils.py
+index 3778877..e2630d3 100644
+--- a/verl/utils/vllm_utils.py
++++ b/verl/utils/vllm_utils.py
+@@ -69,7 +69,10 @@ from typing import List
+ 
+ from msgspec import field
+ from packaging import version as vs
+-from vllm.lora.models import LoRAModel
++try:
++    from vllm.lora.models import LoRAModel  # vLLM < 0.14
++except ImportError:
++    from vllm.lora.lora_model import LoRAModel  # vLLM >= 0.14
+ from vllm.lora.request import LoRARequest
+ from vllm.lora.utils import get_adapter_absolute_path
+ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+@@ -201,38 +204,65 @@ class VLLMHijack():
+                     hf_to_vllm_mapper = model.hf_to_vllm_mapper
+ 
+                 if isinstance(lora_request, TensorLoRARequest):
+-                    lora = self._lora_model_cls.from_lora_tensors(
+-                        lora_model_id=lora_request.lora_int_id,
+-                        tensors=lora_tensors,
+-                        peft_helper=peft_helper,
+-                        device="cpu",
+-                        dtype=self.lora_config.lora_dtype,
+-                        embeddings=None,
+-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
+-                        embedding_modules=self.embedding_modules,
+-                        embedding_padding_modules=self.embedding_padding_modules,
+-                        weights_mapper=hf_to_vllm_mapper
+-                    )
++                    # New vLLM API: from_lora_tensors uses model_vocab_size instead of
++                    # target_embedding_padding/embedding_modules/embedding_padding_modules
++                    import inspect
++                    flt_sig = inspect.signature(self._lora_model_cls.from_lora_tensors)
++                    if 'model_vocab_size' in flt_sig.parameters:
++                        lora = self._lora_model_cls.from_lora_tensors(
++                            lora_model_id=lora_request.lora_int_id,
++                            tensors=lora_tensors,
++                            peft_helper=peft_helper,
++                            device="cpu",
++                            dtype=self.lora_config.lora_dtype,
++                            model_vocab_size=self.vocab_size,
++                            weights_mapper=hf_to_vllm_mapper
++                        )
++                    else:
++                        lora = self._lora_model_cls.from_lora_tensors(
++                            lora_model_id=lora_request.lora_int_id,
++                            tensors=lora_tensors,
++                            peft_helper=peft_helper,
++                            device="cpu",
++                            dtype=self.lora_config.lora_dtype,
++                            embeddings=None,
++                            target_embedding_padding=self.vocab_size + getattr(self.lora_config, 'lora_extra_vocab_size', 0),
++                            embedding_modules=self.embedding_modules,
++                            embedding_padding_modules=self.embedding_padding_modules,
++                            weights_mapper=hf_to_vllm_mapper
++                        )
+                 else:
+-                    lora = self._lora_model_cls.from_local_checkpoint(
+-                        lora_path,
+-                        expected_lora_modules,
+-                        peft_helper=peft_helper,
+-                        lora_model_id=lora_request.lora_int_id,
+-                        device="cpu",
+-                        dtype=self.lora_config.lora_dtype,
+-                        target_embedding_padding=self.vocab_size +
+-                        self.lora_config.lora_extra_vocab_size,
+-                        embedding_modules=self.embedding_modules,
+-                        embedding_padding_modules=self.embedding_padding_modules,
+-                        weights_mapper=hf_to_vllm_mapper)
++                    flc_sig = inspect.signature(self._lora_model_cls.from_local_checkpoint)
++                    if 'model_vocab_size' in flc_sig.parameters:
++                        lora = self._lora_model_cls.from_local_checkpoint(
++                            lora_path,
++                            expected_lora_modules,
++                            peft_helper=peft_helper,
++                            lora_model_id=lora_request.lora_int_id,
++                            device="cpu",
++                            dtype=self.lora_config.lora_dtype,
++                            model_vocab_size=self.vocab_size,
++                            weights_mapper=hf_to_vllm_mapper)
++                    else:
++                        lora = self._lora_model_cls.from_local_checkpoint(
++                            lora_path,
++                            expected_lora_modules,
++                            peft_helper=peft_helper,
++                            lora_model_id=lora_request.lora_int_id,
++                            device="cpu",
++                            dtype=self.lora_config.lora_dtype,
++                            target_embedding_padding=self.vocab_size +
++                            getattr(self.lora_config, 'lora_extra_vocab_size', 0),
++                            embedding_modules=self.embedding_modules,
++                            embedding_padding_modules=self.embedding_padding_modules,
++                            weights_mapper=hf_to_vllm_mapper)
+             except Exception as e:
+                 raise e
+ 
+-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
++            lora_extra = getattr(self.lora_config, 'lora_extra_vocab_size', 0)
++            if hasattr(lora, 'extra_vocab_size') and lora.extra_vocab_size > lora_extra:
+                 raise ValueError(f"LoRA added vocab size {lora.extra_vocab_size} "
+-                                f"is greater than lora_extra_vocab_size "
+-                                f"{self.lora_config.lora_extra_vocab_size}.")
++                                f"is greater than lora_extra_vocab_size {lora_extra}.")
+             return lora
+ 
+         def do_hijack(target_cls, target_method_name, hooking_method):
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 2f837fa..009422c 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -134,12 +134,16 @@ class ActorRolloutRefWorker(Worker):
+         if not torch.distributed.is_initialized():
+             rank = int(os.environ.get("RANK", 0))
+             world_size = int(os.environ.get("WORLD_SIZE", 1))
+-            torch.distributed.init_process_group(backend=_runtime_pg_backend(multi_backend=True), rank=rank, world_size=world_size)
++            from datetime import timedelta
++            print(f"[DEBUG] Rank {rank}/{world_size} init_process_group, CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','?')}, LOCAL_RANK={os.environ.get('LOCAL_RANK','?')}, role={role}")
++            torch.distributed.init_process_group(backend=_runtime_pg_backend(multi_backend=True), rank=rank, world_size=world_size, timeout=timedelta(seconds=120))
+ 
+         # build device mesh for FSDP
+         world_size = torch.distributed.get_world_size()
+         # TODO(sgm): support FSDP hybrid shard for larger model
++        print(f"[DEBUG] Rank {torch.distributed.get_rank()} creating device_mesh for role={role}, world_size={world_size}")
+         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
++        print(f"[DEBUG] Rank {torch.distributed.get_rank()} device_mesh created for role={role}")
+ 
+         # build device mesh for Ulysses Sequence Parallel
+         self.ulysses_device_mesh = None
+@@ -233,6 +237,7 @@ class ActorRolloutRefWorker(Worker):
+             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+         else:
+             torch_dtype = PrecisionType.to_dtype(torch_dtype)
++        print(f"[DEBUG] Rank {self.rank} _build_model_optimizer role={role}, model_dtype config={fsdp_config.get('model_dtype', None)}, resolved torch_dtype={torch_dtype}")
+ 
+         # override model kwargs
+         attn_implementation = override_model_config.pop(
+@@ -315,7 +320,9 @@ class ActorRolloutRefWorker(Worker):
+                     'bias': "none"
+                 }
+                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
++        print(f"[DEBUG] Rank {self.rank} before barrier in _build_model_optimizer (role={role})")
+         torch.distributed.barrier()
++        print(f"[DEBUG] Rank {self.rank} after barrier in _build_model_optimizer (role={role})")
+ 
+         if self.rank == 0:
+             print_model_size(actor_module)
+@@ -351,7 +358,15 @@ class ActorRolloutRefWorker(Worker):
+         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+         fsdp_strategy = self.config.actor.strategy
+-        sync_module_states = _should_sync_module_states(actor_module)
++        # FIX: _should_sync_module_states checks LOCAL module state, but FSDP requires
++        # this to be consistent across ALL ranks. When using meta tensor init, rank 0
++        # loads actual weights (sync=False) while other ranks have meta weights (sync=True).
++        # This mismatch causes NCCL deadlock. Solution: use all_reduce to ensure consistency.
++        local_sync = _should_sync_module_states(actor_module)
++        sync_tensor = torch.tensor([1 if local_sync else 0], dtype=torch.long)
++        torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX)
++        sync_module_states = sync_tensor.item() > 0
++        print(f"[DEBUG] Rank {self.rank} FSDP wrapping: role={role}, local_sync={local_sync}, sync_states={sync_module_states}, cpu_offload={cpu_offload is not None}, device_id={get_torch_device().current_device()}")
+         if fsdp_strategy == "fsdp":
+             actor_module_fsdp = FSDP(
+                 actor_module,
+@@ -630,6 +645,7 @@ class ActorRolloutRefWorker(Worker):
+             self.rollout, self.rollout_sharding_manager = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+ 
+         if self._is_ref:
++            print(f"[DEBUG] Rank {self.rank} starting ref model build (role={self.role})")
+             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+             self.ref_module_fsdp = self._build_model_optimizer(
+                 model_path=local_path,
+diff --git a/verl/workers/rollout/async_server.py b/verl/workers/rollout/async_server.py
+index 160cdba..d67aec7 100644
+--- a/verl/workers/rollout/async_server.py
++++ b/verl/workers/rollout/async_server.py
+@@ -276,9 +276,12 @@ class AsyncLLMServerManager:
+         self.chat_scheduler: ChatCompletionScheduler = None
+         self.chat_scheduler_loop = None
+         self.chat_scheduler_ready = threading.Event()
+-        self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True)
+-        self.chat_scheduler_thread.start()
+-        self.chat_scheduler_ready.wait()
++        if getattr(self.config.rollout, 'chat_scheduler', None):
++            self.chat_scheduler_thread = threading.Thread(target=self._init_chat_scheduler, daemon=True)
++            self.chat_scheduler_thread.start()
++            self.chat_scheduler_ready.wait()
++        else:
++            self.chat_scheduler_ready.set()
+ 
+     def _init_chat_scheduler(self):
+         self.chat_scheduler_loop = asyncio.new_event_loop()
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 4f8109e..2192a8c 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -28,7 +28,10 @@ from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+ from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+ from vllm.v1.engine.async_llm import AsyncLLM
+ from vllm.v1.executor.abstract import Executor
+-from vllm.worker.worker_base import WorkerWrapperBase
++try:
++    from vllm.worker.worker_base import WorkerWrapperBase
++except ModuleNotFoundError:
++    from vllm.v1.worker.worker_base import WorkerWrapperBase
+ 
+ from verl.utils.fs import copy_to_local
+ from verl.workers.rollout.async_server import AsyncServerBase
+@@ -171,7 +174,6 @@ class AsyncvLLMServer(AsyncServerBase):
+             enforce_eager=config.enforce_eager,
+             gpu_memory_utilization=config.gpu_memory_utilization,
+             disable_custom_all_reduce=True,
+-            disable_mm_preprocessor_cache=True,
+             skip_tokenizer_init=False,
+             max_model_len=max_model_len,
+             load_format="auto",
+@@ -189,13 +191,11 @@ class AsyncvLLMServer(AsyncServerBase):
+         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
+         self.engine = AsyncLLM.from_vllm_config(vllm_config)
+ 
+-        # build serving chat
+-        model_config = self.engine.model_config
++        # build serving chat (vLLM 0.14.x API)
+         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
+-        models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
++        models = OpenAIServingModels(self.engine, BASE_MODEL_PATHS)
+         self.openai_serving_chat = OpenAIServingChat(
+             self.engine,
+-            model_config,
+             models,
+             "assistant",
+             request_logger=RequestLogger(max_log_len=4096),
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 3204dc9..5393f7c 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -414,7 +414,11 @@ class vLLMAsyncRollout:
+         all_kwargs[0]["local_rank"] = 0
+ 
+         self.vllm_config = all_kwargs[0]["vllm_config"]
+-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
++        # vLLM 0.14.x: Ray actors each see only 1 GPU; tell vLLM this is a
++        # ray backend so init_device skips the local_world_size assertion.
++        self.vllm_config.parallel_config.distributed_executor_backend = "ray"
++        # vLLM 0.14.x: WorkerWrapperBase.__init__ only accepts (rpc_rank, global_rank)
++        self.inference_engine = WorkerWrapperBase(rpc_rank=0)
+         self.inference_engine.init_worker(all_kwargs)
+ 
+     def load_model(self, *args, **kwargs):
+diff --git a/verl/workers/sharding_manager/fsdp_vllm.py b/verl/workers/sharding_manager/fsdp_vllm.py
+index d5249ce..6a4c665 100644
+--- a/verl/workers/sharding_manager/fsdp_vllm.py
++++ b/verl/workers/sharding_manager/fsdp_vllm.py
+@@ -245,8 +245,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
+             "0.6.3",
+         ):
+             group = vllm_ps.get_tensor_model_parallel_group()
+-        else:
++        elif hasattr(vllm_ps, 'get_tensor_model_parallel_group'):
+             group = vllm_ps.get_tensor_model_parallel_group().device_group
++        else:
++            # vLLM 0.14.x: get_tensor_model_parallel_group removed
++            group = vllm_ps.get_tp_group().device_group
+ 
+         all_gather_data_proto(data=data, process_group=group)
+         return data
+diff --git a/verl/workers/sharding_manager/megatron_vllm.py b/verl/workers/sharding_manager/megatron_vllm.py
+index a756895..e0084fb 100644
+--- a/verl/workers/sharding_manager/megatron_vllm.py
++++ b/verl/workers/sharding_manager/megatron_vllm.py
+@@ -289,9 +289,13 @@ class MegatronVLLMShardingManager(BaseShardingManager):
+         self.world_size = torch.distributed.get_world_size()
+         self.infer_tp_size = vllm_ps.get_tensor_model_parallel_world_size()
+         self.infer_tp_rank = vllm_ps.get_tensor_model_parallel_rank()
+-        self.infer_tp_group = vllm_ps.get_tensor_model_parallel_group()
+-        if vllm_version not in ("0.5.4", "0.6.3"):
+-            self.infer_tp_group = self.infer_tp_group.device_group
++        if hasattr(vllm_ps, 'get_tensor_model_parallel_group'):
++            self.infer_tp_group = vllm_ps.get_tensor_model_parallel_group()
++            if vllm_version not in ("0.5.4", "0.6.3"):
++                self.infer_tp_group = self.infer_tp_group.device_group
++        else:
++            # vLLM 0.14.x
++            self.infer_tp_group = vllm_ps.get_tp_group().device_group
+         self.train_tp_size = mpu.get_tensor_model_parallel_world_size()
+         self.train_tp_rank = mpu.get_tensor_model_parallel_rank()
+         self.train_tp_group = mpu.get_tensor_model_parallel_group()
