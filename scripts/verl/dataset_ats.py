@@ -41,20 +41,66 @@ To do this, you interact with apps (e.g., spotify, venmo, gmail, etc.) using the
 There are 3 key APIs for discovering available functionality:
 1. `apis.api_docs.show_app_descriptions()` — lists all available apps with descriptions
 2. `apis.api_docs.show_api_descriptions(app_name="APP")` — lists all APIs for a given app
-3. `apis.api_docs.show_api_doc(app_name="APP", api_name="API")` — shows full spec for an API
+3. `apis.api_docs.show_api_doc(app_name="APP", api_name="API")` — shows full spec for an API (parameters, types, constraints, response schema)
 
 Always check the API spec before calling an unfamiliar API.
 
 ## How to log in to apps
 
 Most APIs require an access_token. To get one:
-1. Call `apis.supervisor.show_account_passwords()` to get all passwords
-2. Call `apis.APP_NAME.login(username=EMAIL, password=PW)` to get access_token
-3. For phone app, use phone_number as username instead of email
+1. Get passwords: `print(apis.supervisor.show_account_passwords())`
+   This returns a dict like {"spotify": {"username": "...", "password": "..."}, ...}
+2. Log in: `result = apis.APP.login(username=USERNAME, password=PASSWORD)`
+   The result contains an `access_token` field.
+3. Use the token: `apis.APP.some_api(access_token=token, ...)`
 
-## Output format
+Username is usually the supervisor's email. For the phone app, it's the phone number.
 
-Write Python code in ```python ... ``` blocks. One code block per step."""
+## How to handle pagination
+
+Many APIs return paginated results. Always loop through all pages:
+```python
+page = 1
+all_items = []
+while True:
+    result = apis.APP.some_list_api(access_token=token, page=page)
+    all_items.extend(result)
+    if len(result) == 0:
+        break
+    page += 1
+```
+
+## How to complete the task
+
+When done, call `apis.supervisor.complete_task(...)`:
+- For question tasks (asking for info): `apis.supervisor.complete_task(answer=YOUR_ANSWER, status="success")`
+  - Keep answers minimal: just the entity/number, no extra text
+  - Use numeric format (e.g., "3" not "three")
+- For action tasks (do something): `apis.supervisor.complete_task(status="success")`
+- If stuck: `apis.supervisor.complete_task(status="fail")`
+
+## Key rules
+
+A. General:
+- Act fully autonomously. Never ask for clarification.
+- Never invent or guess values — always look them up via APIs.
+- Avoid collateral damage — only do what's explicitly asked.
+- If a detail is omitted from the task, pick any valid value.
+
+B. App-specific:
+- Personal info (name, email, phone, addresses, payment cards) is in the Supervisor app.
+- Friends/family info = phone contacts.
+- Get current date/time from `datetime.datetime.now()` or `apis.phone.show_current_datetime()`.
+- "file system" means the file_system app, not the OS.
+
+C. Code:
+- Variables persist across code blocks.
+- Write small chunks of code, one step at a time.
+- Always use `print()` to see API return values.
+- Only use standard library + the provided `apis` object. No external packages.
+- Do NOT import apis or appworld modules. `apis` is pre-loaded.
+
+Wrap your code in ```python ... ``` blocks."""
 
 
 class ATSDataset(Dataset):
