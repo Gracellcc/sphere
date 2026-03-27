@@ -45,6 +45,7 @@ python scripts/ats_pipeline.py \
     --log_prob_micro_bs 16 \
     --dev_eval \
     --training_skill_update_k 3 \
+    --phase2_data_threshold 3 \
     --output_dir results/ats_pipeline_full/ \
     --verl_timeout 43200 \
     "$@"

@@ -123,13 +123,23 @@ class ATSDataset(Dataset):
             splits = [s.strip() for s in spec.split("+")]
             ids = []
             for split in splits:
-                task_file = f"/home/yiyangai/srpo/data/datasets/{split}.txt"
+                appworld_root = os.environ.get("APPWORLD_ROOT")
+                if not appworld_root:
+                    raise EnvironmentError(
+                        "APPWORLD_ROOT environment variable must be set "
+                        "(e.g. export APPWORLD_ROOT=/path/to/srpo)"
+                    )
+                task_file = f"{appworld_root}/data/datasets/{split}.txt"
                 if os.path.exists(task_file):
                     with open(task_file) as f:
                         ids.extend([line.strip() for line in f if line.strip()])
                 else:
                     try:
-                        os.environ.setdefault("APPWORLD_ROOT", "/home/yiyangai/srpo")
+                        if not os.environ.get("APPWORLD_ROOT", ""):
+                            raise EnvironmentError(
+                                "APPWORLD_ROOT environment variable must be set "
+                                "to load AppWorld splits"
+                            )
                         from appworld import load_task_ids
                         ids.extend(list(load_task_ids(split)))
                     except ImportError:

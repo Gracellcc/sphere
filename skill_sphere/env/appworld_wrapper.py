@@ -7,6 +7,7 @@ environment (appworld_env) to avoid pydantic v1/v2 conflicts.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ class AppWorldEnv:
     pydantic v1 (required by AppWorld's sqlmodel dependency).
     """
 
-    CONDA_ENV = "appworld_env"
+    CONDA_ENV = os.environ.get("APPWORLD_CONDA_ENV", "appworld_env")
 
     def __init__(
         self,

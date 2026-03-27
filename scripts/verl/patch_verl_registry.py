@@ -11,7 +11,11 @@ This script patches both files to add 'ats' cases. Idempotent — safe to run mu
 import os
 import sys
 
-SELFSKILL_ROOT = os.environ.get("SELFSKILL_ROOT", "/home/yiyangai/SelfSkill")
+SELFSKILL_ROOT = os.environ.get("SELFSKILL_ROOT", "")
+if not SELFSKILL_ROOT:
+    print("ERROR: SELFSKILL_ROOT environment variable must be set "
+          "(e.g. export SELFSKILL_ROOT=/path/to/SelfSkill)")
+    sys.exit(1)
 SPHERE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 ATS_MARKER = "# === ATS+Sphere patch ==="

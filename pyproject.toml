@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill-sphere"
+version = "0.1.0"
+description = "Skill Sphere: A spherical geometry-based skill framework for LLM agents"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "numpy",
+]
+
+[project.optional-dependencies]
+full = [
+    "transformers>=4.37",
+    "sentence-transformers>=2.5",
+    "vllm>=0.11.0",
+    "alfworld",
+    "geoopt>=0.5",
+    "faiss-gpu",
+    "wandb",
+    "matplotlib",
+    "umap-learn",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+include = ["skill_sphere*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

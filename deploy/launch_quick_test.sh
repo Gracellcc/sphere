@@ -44,6 +44,7 @@ python scripts/ats_pipeline.py \
     --gpu_mem_util 0.6 \
     --log_prob_micro_bs 16 \
     --dev_eval \
+    --training_skill_update_k 1 \
     --output_dir results/ats_pipeline_quick_test/ \
     --verl_timeout 7200 \
     "$@"

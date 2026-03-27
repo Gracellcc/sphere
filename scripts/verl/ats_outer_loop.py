@@ -87,12 +87,14 @@ class ATSOuterLoop:
         self.active_training_skill = self._find_active_training_skill()
 
         # API client for candidate generation
+        _endpoint = azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        if not _endpoint:
+            raise EnvironmentError(
+                "AZURE_OPENAI_ENDPOINT must be set (via argument or environment variable)"
+            )
         self.client = AzureOpenAI(
             api_key=azure_api_key or os.environ.get("AZURE_OPENAI_API_KEY"),
-            azure_endpoint=azure_endpoint or os.environ.get(
-                "AZURE_OPENAI_ENDPOINT",
-                "https://linjl-ma65uv6u-eastus2.cognitiveservices.azure.com"
-            ),
+            azure_endpoint=_endpoint,
             api_version="2025-01-01-preview",
         )
         self.verifier_model = verifier_model
@@ -607,6 +609,16 @@ class ATSOuterLoop:
 
         step_dist = stats.get("step_distribution", {})
 
+        # Pre-compute conditional strings to avoid backslash-in-fstring issues (Python 3.10)
+        training_skill_json_line = (
+            '"training_skill": {"title": "...", "data_selection": "...", "reward_formula": "...", "when_to_use": "..."},'
+            if update_training else ""
+        )
+        training_skill_rule_line = (
+            "- You may also propose a new training skill or modify the active one"
+            if update_training else "- Training skill is LOCKED, do not modify it"
+        )
+
         prompt = f"""You are an AI training skill evolver. Analyze the diagnostics and propose improved skills.
 
 ## Current Training Status
@@ -650,7 +662,7 @@ Propose ONE candidate skill configuration. Output valid JSON with this structure
   "behavioral_changes": [
     {{"action": "modify|add|remove", "title": "...", "guidance": "...", "scoring": "...", "when_to_use": "...", "category": "..."}}
   ],
-  {"\"training_skill\": {\"title\": \"...\", \"data_selection\": \"...\", \"reward_formula\": \"...\", \"when_to_use\": \"...\"}," if update_training else ""}
+  {training_skill_json_line}
 }}
 
 Rules:
@@ -659,7 +671,7 @@ Rules:
 - If sphere shows coverage gaps, add skills for uncovered areas
 - If sphere shows redundancy (cosine>0.9), merge or remove one
 - Maximum 3 changes per candidate (modify/add/remove)
-{"- You may also propose a new training skill or modify the active one" if update_training else "- Training skill is LOCKED, do not modify it"}
+{training_skill_rule_line}
 """
         return prompt
 
@@ -705,7 +717,13 @@ Rules:
 
         Called once per evolution step so all candidates are compared on the same tasks.
         """
-        task_file = "/home/yiyangai/srpo/data/datasets/train.txt"
+        appworld_root = os.environ.get("APPWORLD_ROOT", "")
+        if not appworld_root:
+            raise EnvironmentError(
+                "APPWORLD_ROOT environment variable must be set "
+                "(e.g. export APPWORLD_ROOT=/path/to/srpo)"
+            )
+        task_file = f"{appworld_root}/data/datasets/train.txt"
         if os.path.exists(task_file):
             with open(task_file) as f:
                 all_ids = [l.strip() for l in f if l.strip()]
@@ -969,6 +987,73 @@ Rules:
         except Exception as e:
             print(f"[ATS Outer] Sphere re-index failed: {e}")
 
+    # ── Proxy Eval Only (for Outer GRPO) ─────────────────────────────────
+
+    def proxy_eval_candidates(
+        self, candidates_json_path: str, step: int
+    ) -> Dict:
+        """Proxy eval pre-generated candidates (from OuterGRPO).
+
+        Loads candidates from JSON, runs proxy eval, selects best,
+        updates skill bank, and returns results with per-candidate rewards.
+        """
+        print(f"[ATS Outer] Proxy eval mode: loading {candidates_json_path}")
+        with open(candidates_json_path) as f:
+            candidates = json.load(f)
+
+        if not candidates:
+            return {"action": "no_candidates", "proxy_scores": []}
+
+        # Should we update training skill?
+        update_training = (step % (self.K * self.M) == 0) and (step > 0)
+
+        # Parse candidate text into structured format
+        parsed_candidates = []
+        for c in candidates:
+            text = c.get("text", "")
+            try:
+                parsed = self._parse_candidate(text, update_training)
+                parsed["candidate_id"] = c.get("candidate_id", len(parsed_candidates))
+                parsed["source"] = c.get("source", "model_grpo")
+                parsed_candidates.append(parsed)
+            except Exception as e:
+                print(f"[ATS Outer] Failed to parse candidate {c.get('candidate_id', '?')}: {e}")
+                parsed_candidates.append({
+                    "candidate_id": c.get("candidate_id", len(parsed_candidates)),
+                    "source": "model_grpo",
+                    "reasoning": "",
+                    "behavioral_changes": [],
+                })
+
+        # Proxy eval all candidates on same task set
+        proxy_task_ids = self._sample_proxy_tasks()
+        proxy_scores = []
+
+        if not proxy_task_ids:
+            proxy_scores = [0.5] * len(parsed_candidates)
+            print("[ATS Outer] No proxy eval tasks available, using default scores")
+        else:
+            for c in parsed_candidates:
+                score = self.proxy_eval(c, task_ids=proxy_task_ids)
+                proxy_scores.append(score)
+
+        # Select best and update skill bank
+        result = self.select_and_update(
+            parsed_candidates, proxy_scores, step, update_training
+        )
+        result["proxy_scores"] = proxy_scores
+
+        # Save proxy scores for outer GRPO to read
+        scores_path = os.path.join(self.output_dir, f"proxy_scores_step{step}.json")
+        with open(scores_path, "w") as f:
+            json.dump({
+                "proxy_scores": proxy_scores,
+                "best_idx": int(np.argmax(proxy_scores)) if proxy_scores else 0,
+            }, f, indent=2)
+        print(f"[ATS Outer] Proxy scores saved: {scores_path}")
+
+        return result
+
     # ── Main Entry: Run One Evolution Step ───────────────────────────────
 
     def run_step(self, step: int) -> Dict:
@@ -1067,6 +1152,10 @@ def main():
                         help="Model path for proxy eval (auto-detect from vLLM if None)")
     parser.add_argument("--model_candidate_ratio", type=float, default=0.0,
                         help="Fraction of candidates from model (0=Phase1 all API, 1=Phase2 all model)")
+    parser.add_argument("--candidates_json", type=str, default=None,
+                        help="Path to pre-generated candidates JSON (proxy eval only mode)")
+    parser.add_argument("--proxy_eval_only", action="store_true",
+                        help="Only run proxy eval on pre-generated candidates (for outer GRPO)")
     args = parser.parse_args()
 
     loop = ATSOuterLoop(
@@ -1084,7 +1173,10 @@ def main():
         model_candidate_ratio=args.model_candidate_ratio,
     )
 
-    result = loop.run_step(args.step)
+    if args.proxy_eval_only and args.candidates_json:
+        result = loop.proxy_eval_candidates(args.candidates_json, args.step)
+    else:
+        result = loop.run_step(args.step)
     print(f"\n[ATS Outer] Result: {json.dumps(result, indent=2)}")
 
     # Print active config for inner loop

@@ -27,7 +27,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 DATASET_FILE="$ROOT_DIR/scripts/verl/dataset_ats.py"
 
 export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
-export APPWORLD_ROOT=${APPWORLD_ROOT:-/home/yiyangai/srpo}
+export APPWORLD_ROOT=${APPWORLD_ROOT:?APPWORLD_ROOT must be set}
 # Make our modules importable
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 
@@ -54,7 +54,7 @@ skills_path=${SKILLS_PATH:-$ROOT_DIR/data/skills/appworld_skills_ats.json}
 task_stats_path=${TASK_STATS_PATH:-}
 
 # Azure OpenAI (verifier)
-azure_endpoint=${AZURE_OPENAI_ENDPOINT:-https://linjl-ma65uv6u-eastus2.cognitiveservices.azure.com}
+azure_endpoint=${AZURE_OPENAI_ENDPOINT:?AZURE_OPENAI_ENDPOINT must be set}
 azure_api_key=${AZURE_OPENAI_API_KEY:?AZURE_OPENAI_API_KEY must be set}
 verifier_model=${VERIFIER_MODEL:-gpt-5.4}
 

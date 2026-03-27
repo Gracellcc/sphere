@@ -86,9 +86,14 @@ class ATSRewardManager:
         self.verifier_model = verifier_model
         self.verifier_client = None
         if supervision_weight > 0:
+            _endpoint = azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+            if not _endpoint:
+                raise EnvironmentError(
+                    "AZURE_OPENAI_ENDPOINT must be set (via argument or environment variable)"
+                )
             self.verifier_client = AzureOpenAI(
                 api_key=azure_api_key or os.environ.get("AZURE_OPENAI_API_KEY"),
-                azure_endpoint=azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT"),
+                azure_endpoint=_endpoint,
                 api_version="2025-01-01-preview",
             )
             print(f"[ATS Reward] Verifier enabled: {verifier_model}")

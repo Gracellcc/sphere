@@ -708,6 +708,206 @@ class ATSPipeline:
         self._evolution_data_count += 1
         self.log(f"  Evolution SFT data: {self._evolution_data_count} triplets accumulated")
 
+    def run_outer_grpo_evolution(self, outer_step: int, training_skills: list[dict],
+                                training_skill_locked: bool) -> list[dict]:
+        """Phase 2 outer evolution with GRPO update on skill modification capability.
+
+        Design doc: "GRPO更新θ的skill修改能力"
+          J(θ) = J_inner(θ) + λ_outer · J_outer(θ)
+
+        Flow:
+          1. Collect diagnostics (via ats_outer_loop subprocess)
+          2. Load model → generate G candidates with log probs
+          3. Start vLLM → proxy eval each candidate → stop vLLM
+          4. GRPO update with proxy rewards
+          5. Save updated model
+          6. Best candidate → update skill bank (via ats_outer_loop)
+        """
+        self.log(f"\n{'='*60}")
+        self.log(f"OUTER GRPO EVOLUTION (step {outer_step}, Phase {self._phase})")
+        self.log(f"  lambda_outer={self.args.lambda_outer}, "
+                 f"lr={self.args.outer_grpo_lr}, "
+                 f"G={self.args.n_candidates}")
+        self.log(f"{'='*60}")
+
+        evo_output_dir = os.path.join(self.evolution_dir, f"outer_{outer_step}")
+        os.makedirs(evo_output_dir, exist_ok=True)
+
+        if self.args.dry_run:
+            self.log(f"  [DRY RUN] Would run outer GRPO evolution")
+            return training_skills
+
+        # ── Step 1: Collect diagnostics ──────────────────────────────────
+        self.log("  Step 1: Collecting diagnostics...")
+        diag_cmd = [
+            sys.executable, os.path.join(ROOT_DIR, "scripts/verl/ats_outer_loop.py"),
+            "--skills_path", self.current_skills,
+            "--training_skills_path", self.args.training_skills,
+            "--trajectory_dir", self.dev_eval_dir,
+            "--step", str(outer_step),
+            "--M", str(self.args.n_inner_epochs),
+            "--K", str(self.args.training_skill_update_k),
+            "--G", str(self.args.n_candidates),
+            "--proxy_eval_tasks", "0",  # diagnostics only, no proxy eval
+            "--output_dir", evo_output_dir,
+        ]
+        diag_proc = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=300)
+        if diag_proc.returncode != 0:
+            self.log(f"  Diagnostics failed: {diag_proc.stderr[-300:]}")
+            return training_skills
+
+        # Load diagnostics for the evolution prompt
+        diag_path = os.path.join(evo_output_dir, f"diagnostics_step{outer_step}.json")
+        if not os.path.exists(diag_path):
+            self.log(f"  No diagnostics file found, skipping")
+            return training_skills
+        with open(diag_path) as f:
+            diagnostics = json.load(f)
+
+        # ── Step 2: Generate candidates with log probs ───────────────────
+        self.log("  Step 2: Loading model for outer GRPO generation...")
+        from scripts.verl.outer_grpo import OuterGRPO, build_evolution_messages
+        from scripts.verl.ats_outer_loop import ATSOuterLoop
+
+        # Build evolution prompt (reuse ATSOuterLoop's prompt builder)
+        tmp_loop = ATSOuterLoop(
+            skills_path=self.current_skills,
+            training_skills_path=self.args.training_skills,
+            trajectory_dir=self.dev_eval_dir,
+            output_dir=evo_output_dir,
+        )
+        update_training = not training_skill_locked
+        prompt = tmp_loop._build_evolution_prompt(diagnostics, update_training)
+        messages = build_evolution_messages(prompt)
+
+        # Generate candidates
+        grpo = OuterGRPO(
+            model_path=self.current_model_path,
+            lambda_outer=self.args.lambda_outer,
+            lr=self.args.outer_grpo_lr,
+            gpu_id=self.args.outer_grpo_gpu,
+        )
+        candidates = grpo.generate_candidates(
+            messages, G=self.args.n_candidates
+        )
+
+        if not candidates:
+            self.log("  No candidates generated, skipping")
+            grpo.cleanup()
+            return training_skills
+
+        # Save candidates for proxy eval
+        candidates_path = os.path.join(evo_output_dir, "grpo_candidates.json")
+        serializable = [
+            {"text": c["text"], "candidate_id": c["candidate_id"], "source": c["source"]}
+            for c in candidates
+        ]
+        with open(candidates_path, "w") as f:
+            json.dump(serializable, f, indent=2, ensure_ascii=False)
+        self.log(f"  Generated {len(candidates)} candidates")
+
+        # Free GPU for vLLM proxy eval
+        grpo.cleanup()
+
+        # ── Step 3: Proxy eval via ats_outer_loop ────────────────────────
+        self.log("  Step 3: Proxy eval...")
+        vllm_ok = self._start_vllm_server()
+        if not vllm_ok:
+            self.log("  WARNING: vLLM failed, using heuristic scores")
+
+        proxy_cmd = [
+            sys.executable, os.path.join(ROOT_DIR, "scripts/verl/ats_outer_loop.py"),
+            "--skills_path", self.current_skills,
+            "--training_skills_path", self.args.training_skills,
+            "--trajectory_dir", self.dev_eval_dir,
+            "--step", str(outer_step),
+            "--M", str(self.args.n_inner_epochs),
+            "--K", str(self.args.training_skill_update_k),
+            "--G", str(self.args.n_candidates),
+            "--proxy_eval_tasks", str(self.args.proxy_n_tasks),
+            "--sphere_path", self.current_skills,
+            "--output_dir", evo_output_dir,
+            "--verifier_model", self.args.verifier_model,
+            "--proxy_model_path", self.current_model_path,
+            "--candidates_json", candidates_path,
+            "--proxy_eval_only",
+        ]
+        proxy_proc = subprocess.run(proxy_cmd, capture_output=True, text=True, timeout=3600)
+
+        self._stop_vllm_server()
+
+        if proxy_proc.returncode != 0:
+            self.log(f"  Proxy eval failed: {proxy_proc.stderr[-300:]}")
+            return training_skills
+
+        # Read proxy scores
+        scores_path = os.path.join(evo_output_dir, f"proxy_scores_step{outer_step}.json")
+        if not os.path.exists(scores_path):
+            self.log("  No proxy scores file, skipping GRPO update")
+            return training_skills
+        with open(scores_path) as f:
+            scores_data = json.load(f)
+        proxy_scores = scores_data["proxy_scores"]
+
+        self.log(f"  Proxy scores: {proxy_scores}")
+
+        # ── Step 4: GRPO update ──────────────────────────────────────────
+        self.log("  Step 4: GRPO update on skill evolution capability...")
+
+        # Reload model for gradient update
+        grpo = OuterGRPO(
+            model_path=self.current_model_path,
+            lambda_outer=self.args.lambda_outer,
+            lr=self.args.outer_grpo_lr,
+            gpu_id=self.args.outer_grpo_gpu,
+        )
+
+        # Re-generate candidates to get log probs (model is same, use same seeds)
+        # Actually we need the stored log probs from step 2. Let's re-generate.
+        fresh_candidates = grpo.generate_candidates(
+            messages, G=self.args.n_candidates
+        )
+
+        # Attach rewards
+        for i, c in enumerate(fresh_candidates):
+            c["reward"] = proxy_scores[i] if i < len(proxy_scores) else 0.0
+
+        loss, mean_reward, best_idx = grpo.train_step(fresh_candidates)
+        self.log(f"  GRPO loss: {loss:.6f}, mean_reward: {mean_reward:.4f}, "
+                 f"best: candidate {best_idx}")
+
+        # ── Step 5: Save updated model ───────────────────────────────────
+        grpo_model_dir = os.path.join(self.output_dir, f"outer_grpo_step{outer_step}")
+        grpo.save(grpo_model_dir)
+        self.current_model_path = grpo_model_dir
+        self.log(f"  Model saved: {grpo_model_dir}")
+
+        grpo.cleanup()
+
+        # ── Step 6: Save evolution triplets ──────────────────────────────
+        diag_path = os.path.join(evo_output_dir, f"diagnostics_step{outer_step}.json")
+        history_path = os.path.join(evo_output_dir, "evolution_history.json")
+        if os.path.exists(history_path):
+            with open(history_path) as f:
+                history = json.load(f)
+            for record in (history if isinstance(history, list) else [history]):
+                self._save_evolution_triplet(
+                    outer_step, diag_path,
+                    {"reasoning": record.get("reasoning", ""),
+                     "changes": record.get("changes", [])},
+                    record.get("best_score", 0.0),
+                    training_skill_locked,
+                )
+
+        # Check if training skills were updated
+        if not training_skill_locked and os.path.exists(self.args.training_skills):
+            with open(self.args.training_skills) as f:
+                training_skills = json.load(f)
+                if isinstance(training_skills, dict):
+                    training_skills = training_skills.get("training_skills", [training_skills])
+
+        return training_skills
+
     def run_outer_evolution(self, outer_step: int, training_skills: list[dict],
                            training_skill_locked: bool) -> list[dict]:
         """Run outer loop: diagnostics → candidates → proxy eval → update skills.
@@ -1016,19 +1216,24 @@ class ATSPipeline:
             self.log(f"  Training skill locked: {training_locked} "
                      f"(K={K}, step={outer})")
 
-            if not self.args.skip_evolution and not self.args.dry_run:
-                # Start vLLM server for proxy eval (uses GPUs freed by veRL)
-                vllm_ok = self._start_vllm_server()
-                if not vllm_ok:
-                    self.log("  WARNING: vLLM server failed, proxy eval will use heuristic fallback")
-
             if not self.args.skip_evolution:
-                training_skills = self.run_outer_evolution(
-                    outer, training_skills, training_locked)
+                if self._phase >= 2:
+                    # Phase 2: Outer GRPO — model generates candidates + GRPO update
+                    self.log(f"  Phase 2: Running outer GRPO evolution")
+                    training_skills = self.run_outer_grpo_evolution(
+                        outer, training_skills, training_locked)
+                else:
+                    # Phase 1: API-driven evolution (no GRPO on outer loop)
+                    if not self.args.dry_run:
+                        vllm_ok = self._start_vllm_server()
+                        if not vllm_ok:
+                            self.log("  WARNING: vLLM server failed, proxy eval will use heuristic fallback")
 
-            if not self.args.skip_evolution and not self.args.dry_run:
-                # Stop vLLM server to free GPU for next inner loop
-                self._stop_vllm_server()
+                    training_skills = self.run_outer_evolution(
+                        outer, training_skills, training_locked)
+
+                    if not self.args.dry_run:
+                        self._stop_vllm_server()
 
             # 5. Phase transition check + Phase 2 ratio ramp
             if self._phase == 1:
@@ -1145,6 +1350,12 @@ def main():
     # Phase 2
     parser.add_argument("--phase2_tgc_threshold", type=float, default=0.15)
     parser.add_argument("--phase2_data_threshold", type=int, default=25)
+    parser.add_argument("--lambda_outer", type=float, default=0.1,
+                        help="Outer GRPO loss weight: J = J_inner + lambda_outer * J_outer")
+    parser.add_argument("--outer_grpo_lr", type=float, default=1e-6,
+                        help="Learning rate for outer GRPO")
+    parser.add_argument("--outer_grpo_gpu", type=int, default=0,
+                        help="GPU for outer GRPO model (others free for vLLM proxy eval)")
 
     # Timeouts
     parser.add_argument("--verl_timeout", type=int, default=43200,
